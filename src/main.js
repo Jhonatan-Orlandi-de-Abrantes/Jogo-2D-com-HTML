@@ -3,11 +3,12 @@ import { canvas, ctx } from "./engine.js";
 import { config, saveConfig } from "./config.js";
 import {
   pressed, down, pollGamepad, hasGamepad,
-  gpMenuUp, gpMenuDown, gpMenuSelect, gpMenuBack, gpMenuOptions,
+  gpMenuUp, gpMenuDown, gpMenuSelect, gpMenuBack,
   gpMenuLeft, gpMenuRight, gpNewButtonPress, clearPressed,
-  captureButtonsSnapshot, detectNewButtonFromSnapshot
+  captureButtonsSnapshot, detectNewButtonFromSnapshot,
+  gpActionPressed, gpActionDown, remapGamepad, consumeGamepadAction
 } from "./input.js";
-import { music, moveMenuSfx, applyVolumes, jumpSfx, stompSfx, gameOverSfx, winSfx } from "./audio.js";
+import { music, moveMenuSfx, applyVolumes, jumpSfx, stompSfx, gameOverSfx, winSfx, setMusic } from "./audio.js";
 import * as WORLD from "./world.js";
 import * as P from "./player.js";
 import * as E from "./enemies.js";
@@ -33,12 +34,12 @@ window.addEventListener("keydown", unlockAudio);
 window.addEventListener("mousedown", unlockAudio);
 
 /* states */
-const STATE = { MENU:0, OPTIONS:1, CONTROLS:2, RECORDS:3, GAME:4, PAUSE:5, GAMEOVER:6, SUCCESS:7 };
+const STATE = { MENU:0, OPTIONS:1, CONTROLS:2, RECORDS:3 /* repurposed: LEVEL SELECT */, GAME:4, PAUSE:5, GAMEOVER:6, SUCCESS:7 };
 let state = STATE.MENU;
 
 /* menu labels */
 let menuIndex = 0;
-function menuLabels() { const m = t().menu; return [m.play, m.options, m.records]; }
+function menuLabels() { const m = t().menu; return [m.play, m.options]; } // removed Records
 
 /* options */
 let optionsIndex = 0;
@@ -46,7 +47,8 @@ const baseOptionsKeys = ["musicVol","sfxVol","language","controls","clearData"];
 
 /* controls */
 let controlIndex = 0;
-const controlActions = ["left","right","jump"];
+// added "restart" and "pause" actions
+const controlActions = ["left","right","jump","restart","pause"];
 let remapKey = null;
 let remapGP = null;
 let remapKeyListenerAttached = false;
@@ -60,7 +62,28 @@ let endTime = 0;
 let pauseAccum = 0;
 let pauseStartedAt = null;
 let pauseOptionsActive = false;
-let record = Number(localStorage.getItem("record")) || null;
+let currentLevel = 1;
+
+/* level system */
+const LEVELS = [
+  { id: 1, key: "field" },
+  { id: 2, key: "cave" }
+];
+let levelSelectIndex = 0;
+
+// load unlocked level from config (config.unlockedLevel exists)
+let unlockedLevel = config.unlockedLevel || 1;
+
+// per-level records map { [id]: number|null }
+let perLevelRecords = {};
+function loadRecords() {
+  perLevelRecords = {};
+  for (const lvl of LEVELS) {
+    const v = Number(localStorage.getItem(`record_${lvl.id}`));
+    perLevelRecords[lvl.id] = (isFinite(v) && v > 0) ? v : null;
+  }
+}
+loadRecords();
 
 /* clear confirm */
 let confirmClear = false;
@@ -90,8 +113,10 @@ function resetMenuState() {
   confirmClearIndex = 0;
 }
 
-/* ===== startGame: restore lives ===== */
-function startGame() {
+/* ===== startGame: restore lives; now accepts level number ===== */
+function startGame(level = 1) {
+  currentLevel = level;
+  if (typeof WORLD.loadLevel === "function") WORLD.loadLevel(level); // safe-call: load the level data
   P.resetPlayer();
   E.resetEnemies();
   if (P.player) P.player.lives = 3;
@@ -101,6 +126,13 @@ function startGame() {
   pauseStartedAt = null;
   pauseOptionsActive = false;
   state = STATE.GAME;
+
+  // set music per level:
+  if (level === 2) {
+    try { setMusic("assets/cave_music.wav"); } catch {}
+  } else {
+    try { setMusic("assets/menu_music.wav"); } catch {}
+  }
 }
 
 /* effective options keys (keeps same order as UI) */
@@ -127,9 +159,9 @@ function remapKeyHandler(e) {
 /* handle input */
 let lastGPNavTime = 0;
 function handleInput() {
+  const gp = pollGamepad();
   // if confirmClear active, handle its navigation first
   if (confirmClear) {
-    const gp = pollGamepad();
     const now = performance.now();
     let gpLeft = false, gpRight = false, gpSelect = false, gpBack = false;
     if (gp) {
@@ -146,7 +178,10 @@ function handleInput() {
     if (pressed("Enter") || gpSelect) {
       if (confirmClearIndex === 0) { confirmClear = false; playMove(); return; }
       // confirm action:
+      // clear global record (legacy) and per-level records
       localStorage.removeItem("record");
+      for (const lvl of LEVELS) localStorage.removeItem(`record_${lvl.id}`);
+
       localStorage.removeItem("language");
       localStorage.removeItem("musicVol");
       localStorage.removeItem("sfxVol");
@@ -156,11 +191,13 @@ function handleInput() {
       config.language = "pt";
       config.musicVol = 0.5;
       config.sfxVol = 0.6;
-      config.keys = { left: "ArrowLeft", right: "ArrowRight", jump: "Space", pause: "Escape" };
-      config.gamepad = { left: null, right: null, jump: null };
+      config.keys = { left: "ArrowLeft", right: "ArrowRight", jump: "Space", pause: "Escape", restart: "KeyR" };
+      config.gamepad = { left: 14, right: 15, jump: 0, restart: 8, pause: 9 };
       saveConfig();
       applyVolumes();
-      record = null;
+      unlockedLevel = config.unlockedLevel = 1;
+      saveConfig();
+      loadRecords();
       confirmClear = false;
       playMove();
       return;
@@ -168,7 +205,6 @@ function handleInput() {
     return;
   }
 
-  const gp = pollGamepad();
   const now = performance.now();
   let gpUp = false, gpDown = false, gpSelect = false, gpBack = false, gpOptions = false, gpLeft = false, gpRight = false;
   if (gp) {
@@ -178,22 +214,44 @@ function handleInput() {
     if (gpMenuRight(gp) && now - lastGPNavTime > 120) { gpRight = true; lastGPNavTime = now; }
     if (gpMenuSelect(gp)) gpSelect = true;
     if (gpMenuBack(gp)) gpBack = true;
-    if (gpMenuOptions(gp)) gpOptions = true;
+    // use action-based check for pause/options (customizable)
+    if (gpActionPressed('pause')) gpOptions = true;
   }
 
   // GAMEOVER / SUCCESS handled in update()
 
-  // ESC / B / Back
-  if (pressed("Escape") || gpBack) {
+  // ESC / Back / Pause handling:
+  // - In GAME: only pressed("Escape") or gpActionPressed('pause') open pause.
+  // - gpBack (B) is treated as Back/Cancel in menus, but does NOT open pause when in-game.
+  const escapePressed = pressed("Escape");
+  const pauseActionPressed = gpActionPressed('pause');
+
+  if (escapePressed || pauseActionPressed || gpBack) {
+    // remap cancellation takes precedence
     if (remapKey) { remapKey = null; return; }
     if (remapGP) { remapGP = null; remapGpSnapshot = null; return; }
 
+    // In-game: only open pause if explicit pause action or Escape key
     if (state === STATE.GAME) {
-      pauseStartedAt = Date.now();
-      pauseOptionsActive = true;
-      state = STATE.PAUSE;
-      return;
+      if (escapePressed || pauseActionPressed) {
+        pauseStartedAt = Date.now();
+        pauseOptionsActive = true;
+        state = STATE.PAUSE;
+
+        // --- NEW: consume the gamepad action to avoid immediate close ---
+        // clear keyboard pressed flags too
+        clearPressed(["Space","Enter","KeyO","Escape"]);
+        try { consumeGamepadAction('pause'); } catch(e) {}
+        // -----------------------------------------------------------
+
+        return;
+      } else {
+        // gpBack pressed during gameplay but not mapped to pause -> ignore here
+        return;
+      }
     }
+
+    // Pause state: behave as before (toggle resume)
     if (state === STATE.PAUSE) {
       if (pauseOptionsActive) {
         pauseAccum += Date.now() - pauseStartedAt;
@@ -209,12 +267,19 @@ function handleInput() {
       return;
     }
 
+    // Controls page -> go back to previous state
     if (state === STATE.CONTROLS) {
       state = controlsPrevState || STATE.MENU;
       return;
     }
 
-    if ([STATE.OPTIONS, STATE.RECORDS].includes(state)) {
+    // Level select (RECORDS) -> back to menu
+    if (state === STATE.RECORDS) {
+      state = STATE.MENU; return;
+    }
+
+    // Options -> back to menu
+    if ([STATE.OPTIONS].includes(state)) {
       state = STATE.MENU; return;
     }
   }
@@ -225,11 +290,33 @@ function handleInput() {
     if (pressed("ArrowDown") || gpDown) { menuIndex = (menuIndex + 1) % menuLabels().length; playMove(); }
     if (pressed("Enter") || (gp && gpSelect)) {
       const sel = menuLabels()[menuIndex];
-      if (sel === t().menu.play) startGame();
+      if (sel === t().menu.play) {
+        // open level select
+        state = STATE.RECORDS;
+        levelSelectIndex = 0;
+      }
       else if (sel === t().menu.options) { state = STATE.OPTIONS; optionsIndex = 0; playMove(); }
-      else if (sel === t().menu.records) { state = STATE.RECORDS; playMove(); }
     }
-    if (pressed("KeyO") || (gp && gpOptions)) { state = STATE.OPTIONS; optionsIndex = 0; playMove(); }
+    if (pressed("KeyO") || gpOptions) { state = STATE.OPTIONS; optionsIndex = 0; playMove(); }
+    return;
+  }
+
+  // LEVEL SELECT (we repurposed STATE.RECORDS for this)
+  if (state === STATE.RECORDS) {
+    if (pressed("ArrowDown") || gpDown) { levelSelectIndex = (levelSelectIndex + 1) % LEVELS.length; playMove(); }
+    if (pressed("ArrowUp") || gpUp) { levelSelectIndex = (levelSelectIndex - 1 + LEVELS.length) % LEVELS.length; playMove(); }
+
+    if (pressed("Enter") || (gp && gpSelect)) {
+      const chosen = LEVELS[levelSelectIndex];
+      if (chosen && chosen.id <= (config.unlockedLevel || 1)) {
+        playMove();
+        startGame(chosen.id);
+      } else {
+        // not unlocked - play "move" sfx only
+        playMove();
+      }
+    }
+
     return;
   }
 
@@ -301,10 +388,16 @@ function handleInput() {
 
   // GAME
   if (state === STATE.GAME) {
-    if (pressed("KeyO") || (gp && gpOptions)) {
+    // allow opening pause/options by mapped keyboard or gamepad 'pause' action
+    if (pressed("KeyO") || gpActionPressed('pause')) {
       pauseStartedAt = Date.now();
       pauseOptionsActive = true;
       state = STATE.PAUSE;
+
+      // consume to avoid immediate toggle
+      clearPressed(["Space","Enter","KeyO","Escape"]);
+      try { consumeGamepadAction('pause'); } catch(e) {}
+
       return;
     }
     return;
@@ -319,12 +412,9 @@ function handleRemap() {
     if (!remapGpSnapshot) remapGpSnapshot = captureButtonsSnapshot();
     const newIdx = detectNewButtonFromSnapshot(remapGpSnapshot);
     if (newIdx !== null) {
-      // remove duplicates
-      for (const a of Object.keys(config.gamepad)) {
-        if (config.gamepad[a] === newIdx) config.gamepad[a] = null;
-      }
-      config.gamepad[remapGP] = newIdx;
-      saveConfig();
+      // use centralized remap so active map + config stay in sync
+      remapGamepad(remapGP, newIdx);
+
       remapGP = null;
       remapGpSnapshot = null;
       // clear pressed so we don't immediately navigate
@@ -363,6 +453,9 @@ function update() {
 
   if (state !== STATE.GAME) return;
 
+  // update world moving platforms
+  if (typeof WORLD.updateMovingPlatforms === "function") WORLD.updateMovingPlatforms();
+
   const gp = pollGamepad();
   const keysLike = {};
   keysLike[config.keys.left] = down(config.keys.left) || (gp && config.gamepad.left != null && gp.buttons[config.gamepad.left]?.pressed);
@@ -384,7 +477,14 @@ function update() {
   P.updatePlayer(keysLike);
   E.updateEnemies(camX);
 
-  // collisions & enemy logic
+  // ===== restart detection (keyboard once OR gamepad action edge) =====
+  if (pressed(config.keys.restart) || gpActionPressed('restart')) {
+    // restart current level
+    startGame(currentLevel);
+    return; // skip remainder of update this frame
+  }
+
+  // collisions & enemy logic (keeps per-level logic)
   E.enemies.forEach(e => {
     if (!e.alive) return;
     if (e.x < P.player.x + P.player.w && e.x + e.w > P.player.x && e.y < P.player.y + P.player.h && e.y + e.h > P.player.y) {
@@ -427,12 +527,27 @@ function update() {
   if (P.player.x + P.player.w > WORLD.endZone.x && P.player.x < WORLD.endZone.x + WORLD.endZone.w) {
     endTime = Date.now();
     const total = (endTime - startTime - pauseAccum) / 1000;
-    if (!record || total < record) { record = total; localStorage.setItem("record", record); }
+
+    // per-level record storage
+    const prev = perLevelRecords[currentLevel];
+    if (!prev || total < prev) {
+      perLevelRecords[currentLevel] = total;
+      localStorage.setItem(`record_${currentLevel}`, total);
+    }
+
+    // unlock next level (persist in config)
+    if ((config.unlockedLevel || 1) < currentLevel + 1) {
+      config.unlockedLevel = Math.min(LEVELS.length, currentLevel + 1);
+      saveConfig();
+      unlockedLevel = config.unlockedLevel;
+    }
+
     try { winSfx.play().catch(()=>{}); } catch {}
     state = STATE.SUCCESS;
     continueUnlockAt = Date.now() + 200;
     finalScreenLocked = true;
     clearPressed(["Space","Enter","KeyO","Escape"]);
+    return;
   }
 
   camX = Math.max(0, Math.min(P.player.x - 200, WORLD.ground.w - canvas.width));
@@ -463,7 +578,9 @@ function render() {
     UI.drawControlsPage(config.keys, config.gamepad, remapKey, remapGP, controlIndex, overlay);
   }
   else if (state === STATE.RECORDS) {
-    UI.drawRecords(record);
+    // LEVEL SELECT screen
+    const lvlList = LEVELS.map(l => ({ id: l.id, name: (t().phases && t().phases[l.id-1]) || (`Fase ${l.id}`) }));
+    UI.drawLevelSelect(lvlList, levelSelectIndex, config.unlockedLevel || 1, perLevelRecords);
   }
   else if (state === STATE.GAME || state === STATE.PAUSE) {
     E.drawEnemies(ctx, camX);
@@ -496,7 +613,7 @@ function render() {
   }
   else if (state === STATE.SUCCESS) {
     const total = (endTime - startTime - pauseAccum)/1000;
-    UI.drawSuccess(total, record, P.player.lives);
+    UI.drawSuccess(total, perLevelRecords[currentLevel], P.player.lives);
   }
 
   if (gpMsgTimer > 0) UI.drawGlobalGamepadMessage(gpMessage);
