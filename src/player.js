@@ -10,7 +10,7 @@ img.src = "assets/player.png";
 export const player = {
   x: 50, y: 200, w: 32, h: 32,
   vx: 0, vy: 0,
-  speed: 1.8,
+  speed: 3.0,
   jumpForce: -7,
   jumping: false,
   lives: 3,
